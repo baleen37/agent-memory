@@ -20,7 +20,11 @@
 - **자동 기동**: mcp나 CLI가 소켓 연결에 실패하면 데몬을 detached로 띄우고 백오프하며 재시도한다.
 - **유휴 종료**: 클라이언트 0개 + 큐가 빈 상태로 10분이 지나면 종료한다.
 - **성능 저하 시 동작**: 데몬이 없거나 모델 다운로드 중이면 mcp가 SQLite를 직접 읽어 BM25만으로 답한다. 결과에 "vector off"를 표시한다.
-- **버전 교체**: 데몬이 자기 버전을 보고한다. 버전이 다르면 클라이언트가 shutdown을 요청하고 새로 띄운다.
+- **버전 교체 (새 버전 우선)**: 업그레이드 직후에는 구버전 세션(v1 바이너리)과 새 세션(v2)이 함께 돌아간다.
+  1. 연결할 때 handshake로 `{app_version, proto}`를 교환한다. `proto`는 IPC 형식 번호로, 앱 버전과 따로 관리한다.
+  2. 데몬보다 **높은** app_version을 가진 클라이언트만 shutdown을 요청할 수 있다. 낮은 버전 클라이언트는 절대 종료시키지 않는다(핑퐁 방지).
+  3. `proto`가 맞지 않는 클라이언트는 데몬을 쓰지 않고 BM25만으로 동작한다(성능 저하 경로를 재사용).
+  4. shutdown 요청을 받은 데몬은 처리 중인 요청을 마치고 락을 푼 뒤 종료한다. 새 데몬은 `flock`을 잡을 때까지 기다렸다가 시작한다.
 - **바이너리 하나, 서브커맨드 여러 개**: `hook <event>` / `mcp` / `daemon` / `search` / `save` / `status`
 
 ## 3. 저장 (SQLite, `~/.agent-memory/memory.db`)
@@ -32,6 +36,11 @@
 - FTS5(trigram) 인덱스: observations(title, subtitle, narrative, files), memories(title, content, concepts, files)
   - 3글자 미만 검색어는 LIKE로 대체한다(실험으로 확인한 trigram의 한계).
 - project 값은 git toplevel(없으면 cwd)이다.
+- **스키마 버전**: `PRAGMA user_version = major*1000 + minor`로 관리한다.
+  - 같은 major 안에서는 **추가만 하는** 마이그레이션(컬럼·테이블 추가, 기본값 필수)만 허용한다. 그래서 구버전 바이너리도 계속 읽고 쓸 수 있다.
+  - 마이그레이션은 새 바이너리가 처음 열 때 트랜잭션 하나로 실행한다.
+  - 구버전 바이너리가 모르는 major를 만나면 쓰지 않고 종료한다. 훅은 exit 0, mcp는 읽기만 한다.
+- **모델 변경**: 데몬은 현재 모델과 `model_id`가 다른 행을 백그라운드에서 재임베딩한다. 재색인이 끝날 때까지 벡터 검색은 같은 `model_id`끼리만 비교한다.
 
 ## 4. 캡처 (훅, 50ms 이내, 항상 exit 0)
 | 이벤트 | 동작 (agentmemory 기준) |
@@ -118,6 +127,7 @@ skills/: recall, remember, forget, session-history, recap, handoff, memory-disci
   - Claude와 Codex 훅 페이로드 픽스처를 stdin으로 넣는다.
   - MCP JSON-RPC 왕복(initialize → tools/list → tools/call)을 검증한다.
   - **데몬 경쟁 테스트**: 클라이언트 3개를 동시에 띄워 데몬 1개만 뜨는지 확인한다.
+  - **버전 교체 테스트**: v1 데몬에 v2 클라이언트가 붙으면 교체되는지, v1 클라이언트가 v2 데몬에 붙으면 교체되지 않고 BM25로 동작하는지, user_version major가 높은 DB에서 구버전 훅이 쓰지 않는지 확인한다.
 - **임베딩 테스트**: `#[ignore]`로 분리하고 CI에서는 별도 job으로 돌린다(모델 다운로드 필요).
 - **E2E**:
   1. `AGENT_MEMORY_BIN=target/debug/agent-memory claude --plugin-dir .`로 세션 1을 돌린다.
