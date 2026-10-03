@@ -43,7 +43,8 @@
 - **서브커맨드**: `hook <event>` / `mcp` / `daemon` / `search` / `add` / `status`
 
 ## 4. 저장 (SQLite, `~/.agent-memory/memory.db`)
-- WAL 모드, `busy_timeout=5000`. `AGENT_MEMORY_DIR`로 경로를 바꿀 수 있다.
+- WAL 모드, `busy_timeout=500`. `AGENT_MEMORY_DIR`로 경로를 바꿀 수 있다.
+  - 0.5초 안에 락을 못 잡으면 해당 작업을 포기한다. ingest는 offset을 갱신하지 않으므로 다음 Stop에서 같은 구간을 다시 읽는다(멱등).
 - `sessions(id, agent[claude|codex], project, cwd, transcript_path, transcript_offset, started_at, ended_at)`
 - `observations(id "obs_<ts36>_<rand>", session_id, seq, ts, type, title, subtitle, narrative, files_json, UNIQUE(session_id, seq))`, `INDEX(session_id, seq)`
 - `memories(id, project NULL 허용, type[pattern|preference|architecture|bug|workflow|fact], title(content 앞 80자), content, concepts_json, files_json, session_ids_json, version, parent_id, supersedes_json, is_latest, forget_after, created_at, updated_at)` (원본 `types.ts:125-148`에서 LLM 전용 필드 `strength`·`relatedIds`·`sourceObservationIds`·이미지 필드를 뺐다)
