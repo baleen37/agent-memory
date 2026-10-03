@@ -29,8 +29,8 @@
 
 ## 3. 저장 (SQLite, `~/.agent-memory/memory.db`)
 - WAL 모드, `busy_timeout=5000`. `AGENT_MEMORY_DIR`로 경로를 바꿀 수 있다.
-- `sessions(id, agent[claude|codex], project, cwd, started_at, ended_at, first_prompt, summary_json, obs_count)`
-- `observations(id "obs_<ts36>_<rand>", session_id, ts, type, title, subtitle, narrative, files_json, importance=5, confidence=0.3, origin, source_json, hash, event_id UNIQUE)`
+- `sessions(id, agent[claude|codex], project, cwd, transcript_path, transcript_offset, started_at, ended_at, first_prompt, summary_json, obs_count)`
+- `observations(id "obs_<ts36>_<rand>", session_id, ts, type, title, subtitle, narrative, files_json, importance=5, confidence=0.3, origin, source_json, seq, UNIQUE(session_id, seq))`
 - `memories(id, project, type[pattern|preference|architecture|bug|workflow|fact], title, content, concepts_json, files_json, session_ids_json, version, parent_id, is_latest, forget_after, origin, created_at)`
 - `index_queue(ref_kind, ref_id, stage[tokenize|embed])`, `embeddings(ref_kind, ref_id, model_id, dim, vec BLOB)`
 - **FTS5 색인**: `tokenize='porter unicode61 remove_diacritics 2'`, `prefix='2 3'`.
@@ -45,29 +45,36 @@
   - 구버전 바이너리가 모르는 major를 만나면 쓰지 않고 종료한다. 훅은 exit 0, mcp는 읽기만 한다.
 - **모델 변경**: 데몬은 현재 모델과 `model_id`가 다른 행을 백그라운드에서 재임베딩한다. 재색인이 끝날 때까지 벡터 검색은 같은 `model_id`끼리만 비교한다.
 
-## 4. 캡처 (훅, 항상 exit 0)
-- **실행 방식**: 두 호스트 모두 hook 설정의 `"async": true`를 지원한다(Claude 공식 문서, Codex `codex-rs/hooks/src/engine/discovery.rs:533`).
-  - **비동기**: 기록만 하는 훅(UserPromptSubmit, PostToolUse, PostToolUseFailure, Stop, SessionEnd, Subagent*, Notification, TaskCompleted). 에이전트를 기다리게 하지 않으므로 락 대기가 생겨도 체감되지 않는다. 스풀은 두지 않는다. Codex는 SessionEnd의 async를 무시하고 동기로 실행한다.
-  - **동기**: 출력을 호스트에 돌려줘야 하는 훅(SessionStart, PreToolUse, PreCompact). 읽기만 하고 50ms 이내를 목표로 한다.
-  - 비동기 실행은 도착 순서가 바뀔 수 있다. 그래서 `ts`는 훅 프로세스가 시작된 시각으로 찍고, 정렬은 `ts`로 한다.
-| 이벤트 | 동작 (agentmemory 기준) |
-|---|---|
-| SessionStart | 세션을 등록하고 컨텍스트를 **항상** 주입한다(켜고 끄는 설정 없음). |
-| UserPromptSubmit | 프롬프트를 기록한다. 주입은 하지 않는다. |
-| PreToolUse | matcher `Edit\|Write\|Read\|Glob\|Grep`일 때 해당 파일의 과거 관찰과 bug 메모리 최대 3개로 enrich한다. |
-| PostToolUse / PostToolUseFailure | 관찰을 기록한다. 아래 파이프라인을 거친다. |
-| PreCompact | 1500토큰 예산으로 컨텍스트를 다시 주입한다. |
-| Stop | 규칙 기반 세션 요약을 upsert한다(매 턴). `last_assistant_message`도 저장한다. |
-| SessionEnd | 종료를 기록하고, transcript에서 프롬프트를 최대 50개까지 백필한다(event_id로 멱등 처리). |
-| SubagentStart/Stop, Notification, TaskCompleted | 관찰로만 기록한다. |
+## 4. 캡처 (훅 3개 + transcript, 항상 exit 0)
+- **원칙**: 도구 호출마다 기록하지 않는다. 턴이 끝날 때 transcript를 **지난번에 읽은 위치(offset) 이후만** 읽어서 기록한다.
+  - 두 호스트 모두 훅 입력에 `transcript_path`를 넘긴다(Codex `codex-rs/hooks/src/events/stop.rs:32`).
+  - 턴당 훅 프로세스는 1개다. 에이전트를 기다리게 하는 훅은 SessionStart 하나뿐이다.
+- **async**: 두 호스트 모두 `"async": true`를 지원한다(Claude 공식 문서, Codex `engine/discovery.rs:533`). 단, Codex는 SessionEnd의 async를 무시하고 동기로 실행한다.
 
-**PostToolUse 파이프라인**
-1. 제외 도구(`memory_*`, toolsearch 등)는 건너뛴다. 목록은 코드에 고정한다.
-2. 출력을 8000자에서 자르고 base64 이미지를 제거한다.
-3. 중복 제거: `sha256(session:tool:input앞500자:sha256(output))` 해시가 5분 안에 이미 있으면 건너뛴다. event_id가 있으면 그것을 우선한다.
-4. 마스킹: `<private>…</private>`는 `[REDACTED]`, 시크릿 패턴 약 14개(원본 `privacy.ts` 이식)는 `[REDACTED_SECRET]`로 바꾼다.
-5. 규칙 압축: type(도구명 휴리스틱) / title(도구명 80자) / subtitle(입력 120자) / narrative(`prompt|input|output` 400자) / files를 만든다.
-6. INSERT하고 `index_queue`에 등록한다(tokenize, embed 순서).
+| 이벤트 | 실행 | 동작 |
+|---|---|---|
+| SessionStart | 동기, 50ms 이내 목표 | 세션을 등록하고 컨텍스트를 **항상** 주입한다. `source=compact`일 때도 발생해서 PreCompact 역할을 대신한다. |
+| Stop | async | `ingest`: offset 이후의 transcript를 읽어 기록하고 세션 요약을 upsert한다. |
+| SessionEnd | async (Codex는 동기) | 남은 부분을 `ingest`하고 종료를 기록한다. 중단 등으로 Stop이 뜨지 않은 턴도 여기서 처리된다. |
+
+- **쓰지 않는 이벤트**: UserPromptSubmit, PostToolUse(Failure), PreToolUse, PreCompact, Subagent*, Notification, TaskCompleted.
+  - 기록할 내용은 transcript에 다 들어 있다. PreToolUse 보강은 Read·Edit마다 동기로 떠서 비용이 가장 크다(원본도 기본 꺼짐).
+
+**ingest 파이프라인** (Stop, SessionEnd 공통)
+1. `sessions.transcript_offset`부터 끝까지 읽는다. 마지막 줄이 완결되지 않았으면 그 앞까지만 처리한다.
+2. 호스트별 파서(Claude JSONL, Codex rollout JSONL)로 이벤트를 뽑는다.
+   - prompt, tool_call(입력), tool_result(출력, 에러 여부), assistant 메시지
+   - 제외 도구(`memory_*`, toolsearch 등)는 건너뛴다. 목록은 코드에 고정한다.
+3. 마스킹: `<private>…</private>`는 `[REDACTED]`, 시크릿 패턴 약 14개(원본 `privacy.ts` 이식)는 `[REDACTED_SECRET]`로 바꾼다.
+4. 규칙 압축: 출력은 8000자에서 자르고 base64 이미지는 제거한다. 그 뒤 type(도구명 휴리스틱) / title(80자) / subtitle(입력 120자) / narrative(`prompt|input|output` 400자) / files를 만든다.
+5. 트랜잭션 하나로 처리한다.
+   - observations INSERT. `(session_id, seq)` UNIQUE로 멱등을 보장한다.
+   - 세션 요약 upsert
+   - `transcript_offset` 갱신
+   - `index_queue` 등록
+   - 같은 구간을 두 번 읽지 않으므로 해시·5분 창 방식의 중복 제거는 필요 없다.
+6. **파싱 실패 시**: 해당 줄은 건너뛰고 로그를 남긴다. 파서가 통째로 실패하면 훅 입력의 `last_assistant_message`만이라도 기록한다.
+   - transcript 형식은 공식 계약이 아니다. 그래서 실제 샘플을 픽스처로 둔다.
 
 **규칙 기반 세션 요약** (원본에는 없음. 원본은 LLM이 있어야만 요약을 만든다)
 - `{title: 첫 프롬프트, narrative: 마지막 assistant 메시지 요약, filesModified, commands, errors}`
@@ -99,8 +106,8 @@
 ## 7. 플러그인 패키징
 ```
 .claude-plugin/plugin.json      .codex-plugin/plugin.json (skills, mcpServers, hooks: ./hooks/hooks.codex.json, interface)
-hooks/hooks.json (Claude 12개 이벤트)   hooks/hooks.codex.json (Codex 지원 이벤트 + SessionEnd, statusMessage)
-  - 두 파일 모두 기록만 하는 훅에 "async": true
+hooks/hooks.json   hooks/hooks.codex.json (statusMessage 추가)
+  - 두 파일 모두 SessionStart(동기), Stop(async), SessionEnd(async) 3개만 등록한다
   - 경로 변수: Codex는 PLUGIN_ROOT와 CLAUDE_PLUGIN_ROOT를 모두 주입한다(discovery.rs:265)
 .mcp.json → sh -lc 'exec "${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/bin/agent-memory" mcp'
 bin/agent-memory  (bash 래퍼: ~/.agent-memory/bin/agent-memory-v{VER}가 없으면 Release에서 받아 sha256 검증 후 exec. AGENT_MEMORY_BIN 환경변수가 있으면 그 경로를 우선 사용)
@@ -126,7 +133,8 @@ skills/: recall, remember, forget, session-history, recap, handoff, memory-disci
 | 1 | 훅이 HTTP로 데몬에 보내고, 실패하면 스풀에 쌓는다 | 훅이 SQLite에 직접 기록하고, 데몬은 임베딩만 맡는다 | 스풀과 REST 약 10K LOC가 필요 없다 |
 | 2 | KV + 자체 구현 BM25 + 인덱스 영속화, 한글은 어절 단위 | SQLite FTS5 + lindera 형태소 분석 | 쿼리, 영속화, BM25가 내장돼 있다. 조사·복합어 검색이 원본보다 낫다 |
 | 3 | LLM이 없으면 세션 요약이 없다 | 규칙 기반 요약 | 키 없이도 주입 품질이 나온다 |
-| 4 | — | 제외: LLM 기능(4-tier, graph, reflect), 팀·mesh·viewer, lessons | 학습용 MVP 범위 밖이다 |
+| 4 | 훅 12개, 도구 호출마다 HTTP 전송, 해시로 중복 제거 | 훅 3개 + 턴마다 transcript를 offset부터 ingest | 턴당 프로세스 1개, 멱등성이 단순해진다. 대가로 transcript 파서가 2개 필요하다 |
+| 5 | — | 제외: LLM 기능(4-tier, graph, reflect), 팀·mesh·viewer, lessons | 학습용 MVP 범위 밖이다 |
 
 ## 10. 에러 처리
 - 사용자 설정용 환경변수는 두지 않는다. 내부·테스트용 3개만 둔다: `AGENT_MEMORY_DIR`(데이터 경로), `AGENT_MEMORY_DISABLE`(재귀 방지), `AGENT_MEMORY_BIN`(로컬 바이너리).
@@ -136,9 +144,10 @@ skills/: recall, remember, forget, session-history, recap, handoff, memory-disci
 
 ## 11. 검증
 - **사전 측정 (구현 첫 단계)**: `embed-ko-dic`을 켰을 때 바이너리 크기 증가분과 사전 로드 시간을 잰다.
-- **단위 테스트**: 형태소 분석("검색을"→"검색", "검색추천"→"추천"으로 검색되는지), redact, dedup, 규칙 압축, RRF, Jaccard 대체, 토큰 예산
+- **단위 테스트**: 형태소 분석("검색을"→"검색", "검색추천"→"추천"으로 검색되는지), redact, 규칙 압축, RRF, Jaccard 대체, 토큰 예산
 - **통합 테스트**:
   - Claude와 Codex 훅 페이로드 픽스처를 stdin으로 넣는다.
+  - **transcript 파서**: 실제 Claude·Codex transcript 샘플을 픽스처로 둔다. offset 이어 읽기, 마지막 줄이 미완결인 경우, 같은 구간을 두 번 ingest해도 행이 늘지 않는지(멱등) 확인한다.
   - MCP JSON-RPC 왕복(initialize → tools/list → tools/call)을 검증한다.
   - **데몬 경쟁 테스트**: 클라이언트 3개를 동시에 띄워 데몬 1개만 뜨는지 확인한다.
   - **버전 교체 테스트**: v1 데몬에 v2 클라이언트가 붙으면 교체되는지, v1 클라이언트가 v2 데몬에 붙으면 교체되지 않고 BM25로 동작하는지, user_version major가 높은 DB에서 구버전 훅이 쓰지 않는지 확인한다.
