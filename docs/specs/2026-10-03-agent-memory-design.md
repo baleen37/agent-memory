@@ -45,9 +45,9 @@
 ## 4. 캡처 (훅, 50ms 이내, 항상 exit 0)
 | 이벤트 | 동작 (agentmemory 기준) |
 |---|---|
-| SessionStart | 세션을 등록한다. `AGENT_MEMORY_INJECT_CONTEXT=true`일 때만 컨텍스트를 주입한다(**기본 OFF**, 원본과 같음). |
+| SessionStart | 세션을 등록하고 컨텍스트를 **항상** 주입한다(켜고 끄는 설정 없음). |
 | UserPromptSubmit | 프롬프트를 기록한다. 주입은 하지 않는다. |
-| PreToolUse | `INJECT_CONTEXT=true` + matcher `Edit\|Write\|Read\|Glob\|Grep`일 때 해당 파일의 과거 관찰과 bug 메모리 최대 3개로 enrich한다. |
+| PreToolUse | matcher `Edit\|Write\|Read\|Glob\|Grep`일 때 해당 파일의 과거 관찰과 bug 메모리 최대 3개로 enrich한다. |
 | PostToolUse / PostToolUseFailure | 관찰을 기록한다. 아래 파이프라인을 거친다. |
 | PreCompact | 1500토큰 예산으로 컨텍스트를 다시 주입한다. |
 | Stop | 규칙 기반 세션 요약을 upsert한다(매 턴). `last_assistant_message`도 저장한다. |
@@ -55,7 +55,7 @@
 | SubagentStart/Stop, Notification, TaskCompleted | 관찰로만 기록한다. |
 
 **PostToolUse 파이프라인**
-1. 제외 도구(`memory_*`, toolsearch 등)는 건너뛴다. `AGENT_MEMORY_CAPTURE_ALLOW`/`_DENY`로 조정한다.
+1. 제외 도구(`memory_*`, toolsearch 등)는 건너뛴다. 목록은 코드에 고정한다.
 2. 출력을 8000자에서 자르고 base64 이미지를 제거한다.
 3. 중복 제거: `sha256(session:tool:input앞500자:sha256(output))` 해시가 5분 안에 이미 있으면 건너뛴다. event_id가 있으면 그것을 우선한다.
 4. 마스킹: `<private>…</private>`는 `[REDACTED]`, 시크릿 패턴 약 14개(원본 `privacy.ts` 이식)는 `[REDACTED_SECRET]`로 바꾼다.
@@ -117,6 +117,7 @@ skills/: recall, remember, forget, session-history, recap, handoff, memory-disci
 | 4 | — | 제외: LLM 기능(4-tier, graph, reflect), 팀·mesh·viewer, lessons | 학습용 MVP 범위 밖이다 |
 
 ## 10. 에러 처리
+- 사용자 설정용 환경변수는 두지 않는다. 내부·테스트용 3개만 둔다: `AGENT_MEMORY_DIR`(데이터 경로), `AGENT_MEMORY_DISABLE`(재귀 방지), `AGENT_MEMORY_BIN`(로컬 바이너리).
 - 훅은 항상 exit 0으로 끝난다. 에러는 `~/.agent-memory/logs/`에 기록한다.
 - `AGENT_MEMORY_DISABLE=1`이면 모든 훅이 즉시 종료한다. 이후 LLM 압축을 붙일 때 재귀 호출을 막는 용도다.
 - 데몬이 없으면 BM25만으로 동작한다.
