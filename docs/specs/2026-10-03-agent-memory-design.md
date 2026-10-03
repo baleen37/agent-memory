@@ -13,13 +13,13 @@
 세션 A ─ agent-memory mcp (얇은 stdio 프록시) ┐
 세션 B ─ agent-memory mcp                      ├─ unix socket ─ agent-memory daemon (1개만)
 훅들 ──── agent-memory hook <event> → SQLite에 직접 기록 (데몬 불필요)   ├ 임베딩 모델 로드
-                                                                       ├ embed_queue 처리
+                                                                       ├ index_queue 처리 (형태소 분석·임베딩)
                                                                        └ 하이브리드 검색
 ```
 - **싱글턴**: `~/.agent-memory/daemon.lock`에 `flock`을 건다. 락을 못 잡은 쪽은 바로 종료한다.
 - **자동 기동**: mcp나 CLI가 소켓 연결에 실패하면 데몬을 detached로 띄우고 백오프하며 재시도한다.
 - **유휴 종료**: 클라이언트 0개 + 큐가 빈 상태로 10분이 지나면 종료한다.
-- **성능 저하 시 동작**: 데몬이 없거나 모델 다운로드 중이면 mcp가 SQLite를 직접 읽어 BM25만으로 답한다. 결과에 "vector off"를 표시한다.
+- **성능 저하 시 동작**: 데몬이 없거나 모델 다운로드 중이면 mcp가 밀린 큐의 형태소 분석만 직접 처리한 뒤, SQLite를 읽어 BM25만으로 답한다. 결과에 "vector off"를 표시한다.
 - **버전 교체 (새 버전 우선)**: 업그레이드 직후에는 구버전 세션(v1 바이너리)과 새 세션(v2)이 함께 돌아간다.
   1. 연결할 때 handshake로 `{app_version, proto}`를 교환한다. `proto`는 IPC 형식 번호로, 앱 버전과 따로 관리한다.
   2. 데몬보다 **높은** app_version을 가진 클라이언트만 shutdown을 요청할 수 있다. 낮은 버전 클라이언트는 절대 종료시키지 않는다(핑퐁 방지).
@@ -32,9 +32,12 @@
 - `sessions(id, agent[claude|codex], project, cwd, started_at, ended_at, first_prompt, summary_json, obs_count)`
 - `observations(id "obs_<ts36>_<rand>", session_id, ts, type, title, subtitle, narrative, files_json, importance=5, confidence=0.3, origin, source_json, hash, event_id UNIQUE)`
 - `memories(id, project, type[pattern|preference|architecture|bug|workflow|fact], title, content, concepts_json, files_json, session_ids_json, version, parent_id, is_latest, forget_after, origin, created_at)`
-- `embed_queue(ref_kind, ref_id)`, `embeddings(ref_kind, ref_id, model_id, dim, vec BLOB)`
-- FTS5(trigram) 인덱스: observations(title, subtitle, narrative, files), memories(title, content, concepts, files)
-  - 3글자 미만 검색어는 LIKE로 대체한다(실험으로 확인한 trigram의 한계).
+- `index_queue(ref_kind, ref_id, stage[tokenize|embed])`, `embeddings(ref_kind, ref_id, model_id, dim, vec BLOB)`
+- **FTS5 색인**: `tokenize='porter unicode61 remove_diacritics 2'`, `prefix='2 3'`.
+  - 색인하는 것은 원문이 아니라 미리 나눈 `terms` 컬럼이다. 원본처럼 title, subtitle, narrative, files, type(memories는 title, content, concepts, files)을 이어 붙여 만든다.
+  - **형태소 분석**: lindera + lindera-ko-dic(`embed-ko-dic`)으로 한글 구간을 형태소 단위로 나눠 공백으로 이어 붙인다. 영어는 FTS5 porter가 처리한다.
+  - 사전 로드 비용 때문에 훅에서는 하지 않는다. 데몬(없으면 mcp)이 `index_queue`를 처리할 때 한다.
+  - 사전 내장 크기나 로드 시간이 과하면(구현 첫 단계에서 측정) 모델처럼 첫 실행 때 다운로드하는 방식으로 바꾼다.
 - project 값은 git toplevel(없으면 cwd)이다.
 - **스키마 버전**: `PRAGMA user_version = major*1000 + minor`로 관리한다.
   - 같은 major 안에서는 **추가만 하는** 마이그레이션(컬럼·테이블 추가, 기본값 필수)만 허용한다. 그래서 구버전 바이너리도 계속 읽고 쓸 수 있다.
@@ -60,7 +63,7 @@
 3. 중복 제거: `sha256(session:tool:input앞500자:sha256(output))` 해시가 5분 안에 이미 있으면 건너뛴다. event_id가 있으면 그것을 우선한다.
 4. 마스킹: `<private>…</private>`는 `[REDACTED]`, 시크릿 패턴 약 14개(원본 `privacy.ts` 이식)는 `[REDACTED_SECRET]`로 바꾼다.
 5. 규칙 압축: type(도구명 휴리스틱) / title(도구명 80자) / subtitle(입력 120자) / narrative(`prompt|input|output` 400자) / files를 만든다.
-6. INSERT하고 `embed_queue`에 등록한다.
+6. INSERT하고 `index_queue`에 등록한다(tokenize, embed 순서).
 
 **규칙 기반 세션 요약** (원본에는 없음. 원본은 LLM이 있어야만 요약을 만든다)
 - `{title: 첫 프롬프트, narrative: 마지막 assistant 메시지 요약, filesModified, commands, errors}`
@@ -75,7 +78,10 @@
   - Codex: plain stdout
 
 ## 5. 검색
-- **BM25**: FTS5 `bm25()`
+- **BM25**: FTS5 `bm25()`. k1=1.2, b=0.75로 원본과 같다.
+  - 검색어도 lindera로 나눈다. 영어 항은 prefix(`term*`)로 확장한다(원본의 prefix 매칭).
+  - 원본 동의어 사전(`synonyms.ts`, 63줄)을 이식해 OR로 확장한다.
+  - FTS5는 항별 가중치(원본의 prefix ×0.5, 동의어 ×0.7)를 지원하지 않는다. 대신 정확히 일치하는 결과에 순위 보너스를 준다.
 - **벡터**: 데몬이 계산한다. 대상은 모든 관찰의 `title + narrative`, 세션 요약, memories다(원본과 같음).
 - **결합**: 가중 RRF, K=60, BM25 0.4 / 벡터 0.6. 두 스트림 모두에서 일치하면 5% 보너스를 준다. 한 세션에서 최대 3개만 넣는다.
 - **임베딩 모델**: fastembed-rs + **EmbeddingGemma-300m Q4**, MRL로 256차원까지 자른다.
@@ -112,7 +118,7 @@ skills/: recall, remember, forget, session-history, recap, handoff, memory-disci
 | # | 원본 | 우리 | 이유 |
 |---|---|---|---|
 | 1 | 훅이 HTTP로 데몬에 보내고, 실패하면 스풀에 쌓는다 | 훅이 SQLite에 직접 기록하고, 데몬은 임베딩만 맡는다 | 스풀과 REST 약 10K LOC가 필요 없다 |
-| 2 | KV + 자체 구현 BM25 + 인덱스 영속화 | SQLite FTS5 | 쿼리, 영속화, BM25가 내장돼 있다 |
+| 2 | KV + 자체 구현 BM25 + 인덱스 영속화, 한글은 어절 단위 | SQLite FTS5 + lindera 형태소 분석 | 쿼리, 영속화, BM25가 내장돼 있다. 조사·복합어 검색이 원본보다 낫다 |
 | 3 | LLM이 없으면 세션 요약이 없다 | 규칙 기반 요약 | 키 없이도 주입 품질이 나온다 |
 | 4 | — | 제외: LLM 기능(4-tier, graph, reflect), 팀·mesh·viewer, lessons | 학습용 MVP 범위 밖이다 |
 
@@ -123,7 +129,8 @@ skills/: recall, remember, forget, session-history, recap, handoff, memory-disci
 - 데몬이 없으면 BM25만으로 동작한다.
 
 ## 11. 검증
-- **단위 테스트**: redact, dedup, 규칙 압축, RRF, Jaccard 대체, 토큰 예산
+- **사전 측정 (구현 첫 단계)**: `embed-ko-dic`을 켰을 때 바이너리 크기 증가분과 사전 로드 시간을 잰다.
+- **단위 테스트**: 형태소 분석("검색을"→"검색", "검색추천"→"추천"으로 검색되는지), redact, dedup, 규칙 압축, RRF, Jaccard 대체, 토큰 예산
 - **통합 테스트**:
   - Claude와 Codex 훅 페이로드 픽스처를 stdin으로 넣는다.
   - MCP JSON-RPC 왕복(initialize → tools/list → tools/call)을 검증한다.
