@@ -45,7 +45,11 @@
   - 구버전 바이너리가 모르는 major를 만나면 쓰지 않고 종료한다. 훅은 exit 0, mcp는 읽기만 한다.
 - **모델 변경**: 데몬은 현재 모델과 `model_id`가 다른 행을 백그라운드에서 재임베딩한다. 재색인이 끝날 때까지 벡터 검색은 같은 `model_id`끼리만 비교한다.
 
-## 4. 캡처 (훅, 50ms 이내, 항상 exit 0)
+## 4. 캡처 (훅, 항상 exit 0)
+- **실행 방식**: 두 호스트 모두 hook 설정의 `"async": true`를 지원한다(Claude 공식 문서, Codex `codex-rs/hooks/src/engine/discovery.rs:533`).
+  - **비동기**: 기록만 하는 훅(UserPromptSubmit, PostToolUse, PostToolUseFailure, Stop, SessionEnd, Subagent*, Notification, TaskCompleted). 에이전트를 기다리게 하지 않으므로 락 대기가 생겨도 체감되지 않는다. 스풀은 두지 않는다. Codex는 SessionEnd의 async를 무시하고 동기로 실행한다.
+  - **동기**: 출력을 호스트에 돌려줘야 하는 훅(SessionStart, PreToolUse, PreCompact). 읽기만 하고 50ms 이내를 목표로 한다.
+  - 비동기 실행은 도착 순서가 바뀔 수 있다. 그래서 `ts`는 훅 프로세스가 시작된 시각으로 찍고, 정렬은 `ts`로 한다.
 | 이벤트 | 동작 (agentmemory 기준) |
 |---|---|
 | SessionStart | 세션을 등록하고 컨텍스트를 **항상** 주입한다(켜고 끄는 설정 없음). |
@@ -54,7 +58,7 @@
 | PostToolUse / PostToolUseFailure | 관찰을 기록한다. 아래 파이프라인을 거친다. |
 | PreCompact | 1500토큰 예산으로 컨텍스트를 다시 주입한다. |
 | Stop | 규칙 기반 세션 요약을 upsert한다(매 턴). `last_assistant_message`도 저장한다. |
-| SessionEnd (Claude 전용) | 종료를 기록하고, transcript에서 프롬프트를 최대 50개까지 백필한다(event_id로 멱등 처리). |
+| SessionEnd | 종료를 기록하고, transcript에서 프롬프트를 최대 50개까지 백필한다(event_id로 멱등 처리). |
 | SubagentStart/Stop, Notification, TaskCompleted | 관찰로만 기록한다. |
 
 **PostToolUse 파이프라인**
@@ -95,7 +99,9 @@
 ## 7. 플러그인 패키징
 ```
 .claude-plugin/plugin.json      .codex-plugin/plugin.json (skills, mcpServers, hooks: ./hooks/hooks.codex.json, interface)
-hooks/hooks.json (Claude 12개 이벤트)   hooks/hooks.codex.json (6개, statusMessage)
+hooks/hooks.json (Claude 12개 이벤트)   hooks/hooks.codex.json (Codex 지원 이벤트 + SessionEnd, statusMessage)
+  - 두 파일 모두 기록만 하는 훅에 "async": true
+  - 경로 변수: Codex는 PLUGIN_ROOT와 CLAUDE_PLUGIN_ROOT를 모두 주입한다(discovery.rs:265)
 .mcp.json → sh -lc 'exec "${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/bin/agent-memory" mcp'
 bin/agent-memory  (bash 래퍼: ~/.agent-memory/bin/agent-memory-v{VER}가 없으면 Release에서 받아 sha256 검증 후 exec. AGENT_MEMORY_BIN 환경변수가 있으면 그 경로를 우선 사용)
 skills/: recall, remember, forget, session-history, recap, handoff, memory-discipline
