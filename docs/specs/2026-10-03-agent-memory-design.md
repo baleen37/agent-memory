@@ -110,7 +110,11 @@ hooks/hooks.json   hooks/hooks.codex.json (statusMessage 추가)
   - 두 파일 모두 SessionStart(동기), Stop(async), SessionEnd(async) 3개만 등록한다
   - 경로 변수: Codex는 PLUGIN_ROOT와 CLAUDE_PLUGIN_ROOT를 모두 주입한다(discovery.rs:265)
 .mcp.json → sh -lc 'exec "${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/bin/agent-memory" mcp'
-bin/agent-memory  (bash 래퍼: ~/.agent-memory/bin/agent-memory-v{VER}가 없으면 Release에서 받아 sha256 검증 후 exec. AGENT_MEMORY_BIN 환경변수가 있으면 그 경로를 우선 사용)
+bin/agent-memory  (bash 래퍼, 아래 순서로 실행할 바이너리를 정한다)
+  1. AGENT_MEMORY_BIN 환경변수가 있으면 그 경로
+  2. ~/.agent-memory/bin/agent-memory-v{VER}가 있으면 그것
+  3. 설치된 것 중 VER보다 높은 버전이 있으면 그것 (업그레이드 전에 열린 세션의 훅용)
+  4. 모두 없으면 Release에서 받아 sha256을 검증한 뒤 설치하고, **다른 버전은 모두 삭제**한다 (항상 1개만 유지. 실행 중인 프로세스는 Unix 특성상 영향 없음)
 skills/: recall, remember, forget, session-history, recap, handoff, memory-discipline
 ```
 - Codex Desktop은 플러그인 훅 버그(openai/codex#16430)가 있다. README에 `~/.codex/hooks.json` 수동 병합 방법을 안내한다.
